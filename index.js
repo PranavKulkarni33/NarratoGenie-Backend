@@ -39,6 +39,7 @@ app.post('/process', async (req, res) => {
       { inputs: content },
       {
         headers: { Authorization: `Bearer ${HUGGING_FACE_API_KEY}` },
+        params: { max_length: 100 },
       }
     );
     const summary = summaryResponse.data[0]?.summary_text || 'No summary generated';
@@ -95,9 +96,19 @@ app.post('/process', async (req, res) => {
     const s3VideoResponse = await uploadVideoToS3('narratogenie-video', videoFileName, outputVideoPath);
     console.log('Video uploaded to S3:', s3VideoResponse.Location);
 
-    // Cleanup temporary files
+    // Step 8: Cleanup Generated Files in S3 and Locally
+    const transcriptionJsonFile = `${transcriptionJobName}.json`;
+
+    await Promise.all([
+      deleteFromS3('narratogenie-audio', audioFileName),
+      deleteFromS3('narratogenie-audio', transcriptionJsonFile),
+      deleteFromS3('narratogenie-audio', path.basename(assFilePath)),
+    ]);
+
+    // Delete local files
     fs.unlinkSync(audioLocalPath);
-    
+    fs.unlinkSync(assFilePath);
+    fs.unlinkSync(outputVideoPath);
 
     res.json({
       message: 'Process completed successfully',
@@ -115,7 +126,6 @@ app.listen(PORT, () => {
   console.log(`Server is running on http://localhost:${PORT}`);
 });
 
-// Function to Generate ASS with Centered, Smaller Text, and Word Transitions
 function generateASS(transcriptionResult, filePath) {
   const items = transcriptionResult.results.items;
 
@@ -128,22 +138,50 @@ PlayDepth: 0
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default, Arial, 24, &H00FFFFFF, &H000000FF, &H00000000, &H64000000, -1, 0, 1, 1, 0, 2, 20, 20, 50, 1
+Style: Default, Arial, 18, &H0000FFFF, &H000000FF, &H00000000, &H64000000, -1, 0, 1, 1, 1, 5, 20, 20, 50, 1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 `;
 
-    const assBody = items
-    .map((item) => {
-    if (item.start_time && item.end_time && item.alternatives[0]?.content) {
-        const startTime = formatTime(item.start_time);
-        const endTime = formatTime(item.end_time);
-        const text = item.alternatives[0]?.content || '';
+  // Group words by seconds
+  const groupedItems = [];
+  let currentGroup = { start_time: null, end_time: null, text: [] };
 
-        return `Dialogue: 0,${startTime},${endTime},Default,,0,0,0,,${text}`;
+  items.forEach((item) => {
+    if (item.start_time && item.end_time && item.alternatives[0]?.content) {
+      const startTime = Math.floor(parseFloat(item.start_time));
+      const endTime = Math.floor(parseFloat(item.end_time));
+
+      if (currentGroup.start_time === null) {
+        currentGroup.start_time = startTime;
+        currentGroup.end_time = endTime;
+      }
+
+      if (startTime === currentGroup.start_time) {
+        currentGroup.text.push(item.alternatives[0]?.content || '');
+        currentGroup.end_time = Math.max(currentGroup.end_time, endTime);
+      } else {
+        groupedItems.push({ ...currentGroup });
+        currentGroup = { start_time: startTime, end_time: endTime, text: [item.alternatives[0]?.content || ''] };
+      }
     }
-    return '';
+  });
+
+  // Push the last group
+  if (currentGroup.text.length > 0) {
+    groupedItems.push(currentGroup);
+  }
+
+  // Create ASS body
+  const assBody = groupedItems
+    .map((group) => {
+      const startTime = formatTime(group.start_time);
+      const endTime = formatTime(group.end_time);
+      const text = group.text.join(' ');
+
+      // Ensure text for one group appears and disappears before the next group
+      return `Dialogue: 0,${startTime},${endTime},Default,,0,0,0,,${text}`;
     })
     .join('\n');
 
@@ -155,9 +193,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 // Helper Function to Format Time
 function formatTime(seconds) {
   const date = new Date(0);
-  date.setSeconds(parseFloat(seconds));
+  date.setSeconds(seconds);
   return date.toISOString().substr(11, 12).replace('.', ',');
 }
+
 
 async function waitForTranscriptionCompletion(jobName, bucketName) {
   const checkInterval = 5000;
@@ -195,4 +234,17 @@ async function processVideo(videoPath, audioPath, subtitlePath, outputPath, dura
       }
     });
   });
+}
+
+// Function to delete a file from S3
+async function deleteFromS3(bucketName, key) {
+  const s3 = new AWS.S3();
+  return s3
+    .deleteObject({
+      Bucket: bucketName,
+      Key: key,
+    })
+    .promise()
+    .then(() => console.log(`Deleted ${key} from ${bucketName}`))
+    .catch((err) => console.error(`Failed to delete ${key} from ${bucketName}`, err));
 }
